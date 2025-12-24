@@ -1,0 +1,4 @@
+websockets>=11,<14
+pydantic>=2,<3
+orjson>=3.9
+rich>=13

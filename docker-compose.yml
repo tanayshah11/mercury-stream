@@ -1,0 +1,34 @@
+services:
+  p2:
+    build:
+      context: ./services
+      dockerfile: p2/Dockerfile
+    container_name: mercurystream-p2
+    ports:
+      - "9001:9001"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - LOG_LEVEL=INFO
+      - TZ=America/New_York
+    networks:
+      - mercury
+    restart: unless-stopped
+
+  p1:
+    build:
+      context: ./services
+      dockerfile: p1/Dockerfile
+    container_name: mercurystream-p1
+    depends_on:
+      - p2
+    environment:
+      - LOG_LEVEL=INFO
+      - TZ=America/New_York
+    networks:
+      - mercury
+    restart: unless-stopped
+
+networks:
+  mercury:
+    driver: bridge
