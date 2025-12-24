@@ -1,3 +1,4 @@
 pydantic>=2,<3
 orjson>=3.9
 loguru>=0.7
+typer>=0.9

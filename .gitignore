@@ -88,3 +88,6 @@ docs/
 SYSTEM.md
 CLAUDE.md
 
+# Data Files
+incidents/
+replay-incidents/

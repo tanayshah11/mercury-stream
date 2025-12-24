@@ -11,16 +11,26 @@ import orjson
 
 from shared.logger import log
 
+# Optional metrics integration - graceful degradation if metrics module unavailable
+try:
+    from metrics import record_event, record_anomaly, record_incident
+    METRICS_ENABLED = True
+except ImportError:
+    METRICS_ENABLED = False
+    def record_event(latency_ms=None): pass
+    def record_anomaly(t): pass
+    def record_incident(): pass
+
 # Environment configuration
 DRIFT_SAMPLE_FILE = os.getenv("DRIFT_SAMPLE_FILE", "data/drift_samples.jsonl")
 INCIDENTS_DIR = os.getenv("INCIDENTS_DIR", "data/incidents")
-DUPLICATE_LRU_MAX = int(os.getenv("DUPLICATE_LRU_MAX", "50000"))
-LATENCY_BUFFER_SIZE = int(os.getenv("LATENCY_BUFFER_SIZE", "3000"))
-LATENCY_SPIKE_THRESHOLD_MS = int(os.getenv("LATENCY_SPIKE_THRESHOLD_MS", "100"))
-LATENCY_SPIKE_CONSECUTIVE = int(os.getenv("LATENCY_SPIKE_CONSECUTIVE", "2"))
-FLIGHT_PRE_EVENTS = int(os.getenv("FLIGHT_PRE_EVENTS", "5000"))
-FLIGHT_POST_EVENTS = int(os.getenv("FLIGHT_POST_EVENTS", "2000"))
-FLIGHT_COOLDOWN_S = int(os.getenv("FLIGHT_COOLDOWN_S", "60"))
+DUPLICATE_LRU_MAX = int(os.getenv("DUPLICATE_LRU_MAX", "50000"))  # Max trade IDs tracked per symbol
+LATENCY_BUFFER_SIZE = int(os.getenv("LATENCY_BUFFER_SIZE", "3000"))  # Rolling window for p99 calculation
+LATENCY_SPIKE_THRESHOLD_MS = int(os.getenv("LATENCY_SPIKE_THRESHOLD_MS", "100"))  # p99 threshold to trigger spike
+LATENCY_SPIKE_CONSECUTIVE = int(os.getenv("LATENCY_SPIKE_CONSECUTIVE", "2"))  # Consecutive spikes needed to trigger incident
+FLIGHT_PRE_EVENTS = int(os.getenv("FLIGHT_PRE_EVENTS", "5000"))  # Ring buffer size: events before incident
+FLIGHT_POST_EVENTS = int(os.getenv("FLIGHT_POST_EVENTS", "2000"))  # Events captured after incident trigger
+FLIGHT_COOLDOWN_S = int(os.getenv("FLIGHT_COOLDOWN_S", "60"))  # Prevent incident spam
 
 # Schema requirements
 REQUIRED_KEYS = {"type", "product_id", "price", "last_size", "time", "ingest_ts_ms"}
@@ -58,9 +68,10 @@ class DriftResult:
 
 
 def check_schema_drift(event: dict) -> DriftResult:
-    """Check if event has schema drift from expected format."""
+    """Validate event schema against expected structure - detects missing/wrong types/extra fields."""
     missing = [k for k in REQUIRED_KEYS if k not in event]
     type_mismatches = {}
+    # Allow optional fields: recv_ts_ms, trade_id, sequence
     unexpected = [
         k
         for k in event.keys()
@@ -85,57 +96,40 @@ def check_schema_drift(event: dict) -> DriftResult:
 
 
 class LRUSet:
-    """LRU-evicting set for duplicate detection.
-    Args:
-        maxsize: The maximum size of the set.
-
-    How it works:
-        - When an item is added, it is added to the set.
-        - If the set is full, the oldest item is removed.
-        - If the item is already in the set, it is moved to the end of the set.
-        - If the item is not in the set, it is added to the set.
-    """
+    """Memory-efficient duplicate detection - keeps only recent trade IDs, evicts oldest."""
 
     def __init__(self, maxsize: int):
         self.maxsize = maxsize
-        self._data: OrderedDict[Any, None] = OrderedDict()
+        self._data: OrderedDict[Any, None] = OrderedDict()  # OrderedDict = O(1) lookup + LRU ordering
 
     def __contains__(self, item: Any) -> bool:
         if item in self._data:
-            self._data.move_to_end(item)
+            self._data.move_to_end(item)  # Touch to mark as recently used
             return True
         return False
 
     def add(self, item: Any) -> None:
         if item in self._data:
-            self._data.move_to_end(item)
+            self._data.move_to_end(item)  # Refresh position if already exists
         else:
             self._data[item] = None
             if len(self._data) > self.maxsize:
-                self._data.popitem(last=False)
+                self._data.popitem(last=False)  # Evict oldest (FIFO from front)
 
 
 @dataclass
 class SymbolState:
-    last_exchange_ts_ms: int = 0
-    last_sequence: int | None = None
-    trade_ids: LRUSet = field(default_factory=lambda: LRUSet(DUPLICATE_LRU_MAX))
+    """Per-symbol tracking state for integrity checks."""
+    last_exchange_ts_ms: int = 0  # For out-of-order detection
+    last_sequence: int | None = None  # For gap detection
+    trade_ids: LRUSet = field(default_factory=lambda: LRUSet(DUPLICATE_LRU_MAX))  # For duplicate detection
 
 
 class IntegrityTracker:
-    """Track integrity per product_id.
-
-    How it works:
-        - When an event is received, the product ID is extracted.
-        - If the product ID is not in the state, a new state is created.
-        - If the product ID is in the state, the event is checked for duplicates, out of order, and gaps.
-        - The trade ID is added to the LRU set.
-        - The last exchange timestamp is updated.
-        - The last sequence is updated.
-    """
+    """Per-symbol data quality monitoring - detects duplicates, reordering, sequence gaps."""
 
     def __init__(self) -> None:
-        self._states: dict[str, SymbolState] = {}
+        self._states: dict[str, SymbolState] = {}  # Separate state per product_id
 
     def _get_state(self, product_id: str) -> SymbolState:
         if product_id not in self._states:
@@ -143,9 +137,7 @@ class IntegrityTracker:
         return self._states[product_id]
 
     def check(self, event: dict) -> tuple[bool, bool, bool]:
-        """
-        Returns (is_duplicate, is_out_of_order, is_gap).
-        """
+        """Returns (is_duplicate, is_out_of_order, is_gap)."""
         product_id = event.get("product_id", "unknown")
         state = self._get_state(product_id)
 
@@ -153,6 +145,7 @@ class IntegrityTracker:
         is_out_of_order = False
         is_gap = False
 
+        # Duplicate check: have we seen this trade_id before?
         trade_id = event.get("trade_id")
         if trade_id is not None:
             if trade_id in state.trade_ids:
@@ -160,6 +153,7 @@ class IntegrityTracker:
             else:
                 state.trade_ids.add(trade_id)
 
+        # Out-of-order check: is exchange timestamp going backwards?
         time_str = event.get("time", "")
         if time_str:
             try:
@@ -176,6 +170,7 @@ class IntegrityTracker:
             except (ValueError, AttributeError):
                 pass
 
+        # Gap check: is sequence number jumping by >1?
         sequence = event.get("sequence")
         if sequence is not None and state.last_sequence is not None:
             if sequence > state.last_sequence + 1:
@@ -187,7 +182,7 @@ class IntegrityTracker:
 
 
 class LatencySpikeDetector:
-    """Detect latency spikes using rolling p99."""
+    """Rolling p99 latency monitor - triggers on sustained high latency to avoid false positives."""
 
     def __init__(
         self,
@@ -198,38 +193,37 @@ class LatencySpikeDetector:
         self.buffer_size = buffer_size
         self.threshold_ms = threshold_ms
         self.consecutive_required = consecutive_required
-        self._latencies: deque[int] = deque(maxlen=buffer_size)
-        self._consecutive_spikes = 0
+        self._latencies: deque[int] = deque(maxlen=buffer_size)  # Ring buffer auto-evicts oldest
+        self._consecutive_spikes = 0  # Require N consecutive spikes to trigger
 
     def add_sample(self, ingest_ts_ms: int, recv_ts_ms: int) -> bool:
-        """
-        Add latency sample and return True if spike detected.
-        Latency = recv_ts_ms - ingest_ts_ms (P2 receive time - P1 ingest time).
-        """
+        """Returns True if sustained spike detected (latency = P2_recv - P1_ingest)."""
         latency = recv_ts_ms - ingest_ts_ms
         if latency < 0:
-            latency = 0
+            latency = 0  # Clock skew protection
         self._latencies.append(latency)
 
-        if len(self._latencies) < 100:
+        if len(self._latencies) < 100:  # Need baseline before detecting spikes
             return False
 
+        # Calculate p99 from rolling window
         sorted_latencies = sorted(self._latencies)
         p99_idx = int(len(sorted_latencies) * 0.99)
         p99 = sorted_latencies[p99_idx]
 
+        # Require consecutive spikes to avoid false positives from single outliers
         if p99 > self.threshold_ms:
             self._consecutive_spikes += 1
             if self._consecutive_spikes >= self.consecutive_required:
-                self._consecutive_spikes = 0
+                self._consecutive_spikes = 0  # Reset counter after triggering
                 return True
         else:
-            self._consecutive_spikes = 0
+            self._consecutive_spikes = 0  # Reset on normal latency
 
         return False
 
     def get_p99(self) -> int:
-        """Get current p99 latency."""
+        """Current p99 latency for incident metadata."""
         if len(self._latencies) < 10:
             return 0
         sorted_latencies = sorted(self._latencies)
@@ -238,11 +232,11 @@ class LatencySpikeDetector:
 
 
 class DriftSampleWriter:
-    """Async writer for drift samples."""
+    """Background JSONL writer for schema drift samples - non-blocking, drops on backpressure."""
 
     def __init__(self, file_path: str) -> None:
         self.file_path = file_path
-        self._q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1000)
+        self._q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1000)  # Bounded queue
         self._task: asyncio.Task | None = None
 
     async def start(self) -> None:
@@ -251,6 +245,7 @@ class DriftSampleWriter:
             self._task = asyncio.create_task(self._run(), name="drift_writer")
 
     def write(self, event: dict, drift_result: DriftResult) -> None:
+        """Non-blocking write - drops sample if queue full (don't block forensics)."""
         sample = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "event": event,
@@ -261,14 +256,15 @@ class DriftSampleWriter:
         try:
             self._q.put_nowait(orjson.dumps(sample) + b"\n")
         except asyncio.QueueFull:
-            pass
+            pass  # Drop sample on backpressure - don't block consumer
 
     async def _run(self) -> None:
+        """Background task: drain queue to disk."""
         f = open(self.file_path, "ab", buffering=65536)
         try:
             while True:
                 line = await self._q.get()
-                await asyncio.to_thread(f.write, line)
+                await asyncio.to_thread(f.write, line)  # Offload I/O to thread pool
                 await asyncio.to_thread(f.flush)
         finally:
             try:
@@ -278,7 +274,7 @@ class DriftSampleWriter:
 
 
 class FlightRecorder:
-    """Ring buffer flight recorder for incident capture."""
+    """Black box recorder: continuous ring buffer captures N events before + M events after incidents."""
 
     def __init__(
         self,
@@ -291,8 +287,8 @@ class FlightRecorder:
         self.pre_events = pre_events
         self.post_events = post_events
         self.cooldown_s = cooldown_s
-        self._ring: deque[dict] = deque(maxlen=pre_events)
-        self._capturing = False
+        self._ring: deque[dict] = deque(maxlen=pre_events)  # Circular buffer always keeps last N events
+        self._capturing = False  # State machine: normal -> capturing -> finalize
         self._capture_buffer: list[dict] = []
         self._capture_remaining = 0
         self._last_incident_time = 0.0
@@ -300,35 +296,34 @@ class FlightRecorder:
         self._incident_count = 0
 
     def record(self, event: dict) -> None:
-        """Record event to ring buffer or capture buffer."""
+        """Always called: feed ring buffer normally, or capture buffer during incident."""
         if self._capturing:
-            self._capture_buffer.append(event)
+            self._capture_buffer.append(event)  # Capturing post-incident events
             self._capture_remaining -= 1
             if self._capture_remaining <= 0:
-                self._finalize_incident()
+                self._finalize_incident()  # Got enough post events, save to disk
         else:
-            self._ring.append(event)
+            self._ring.append(event)  # Normal operation: ring buffer auto-evicts oldest
 
     def trigger(self, reason: str) -> bool:
-        """
-        Trigger incident capture. Returns True if triggered, False if on cooldown.
-        """
+        """Trigger incident capture. Returns True if triggered, False if on cooldown/already capturing."""
         now = time.monotonic()
         if self._capturing:
-            return False
+            return False  # Already capturing, ignore
         if (now - self._last_incident_time) < self.cooldown_s:
-            return False
+            return False  # Cooldown to prevent spam
 
+        # Start capture: snapshot ring buffer (pre events) + collect post events
         self._capturing = True
-        self._capture_buffer = list(self._ring)
-        self._capture_remaining = self.post_events
+        self._capture_buffer = list(self._ring)  # Copy ring buffer (events leading up to incident)
+        self._capture_remaining = self.post_events  # Now collect N more events after trigger
         self._incident_reason = reason
         self._last_incident_time = now
         log.warning(f"Incident triggered: {reason}")
         return True
 
     def _finalize_incident(self) -> None:
-        """Save incident to disk."""
+        """Write captured events + metadata to disk, then reset."""
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         incident_id = f"{ts}_{uuid.uuid4().hex[:8]}"
         incident_dir = os.path.join(self.incidents_dir, incident_id)
@@ -336,11 +331,13 @@ class FlightRecorder:
         try:
             os.makedirs(incident_dir, exist_ok=True)
 
+            # Write all captured events (pre + post) to JSONL
             events_path = os.path.join(incident_dir, "events.jsonl")
             with open(events_path, "wb") as f:
                 for event in self._capture_buffer:
                     f.write(orjson.dumps(event) + b"\n")
 
+            # Write metadata for incident context
             meta = {
                 "incident_id": incident_id,
                 "reason": self._incident_reason,
@@ -361,9 +358,10 @@ class FlightRecorder:
         except Exception as e:
             log.error(f"Failed to save incident: {e}")
 
+        # Reset to normal operation
         self._capturing = False
         self._capture_buffer = []
-        self._ring.clear()
+        self._ring.clear()  # Clear ring to avoid re-capturing same events
 
     @property
     def incidents_captured(self) -> int:
@@ -371,10 +369,11 @@ class FlightRecorder:
 
 
 async def consumer_forensics(bus: BusLike, print_every_s: float = 10.0) -> None:
-    """Forensics consumer for schema drift, integrity, and latency spike detection."""
+    """Main forensics pipeline: monitors data quality, detects anomalies, captures incidents."""
     q = bus.subscribe(maxsize=5000)
     counters = ForensicsCounters()
 
+    # Initialize all detection/monitoring systems
     integrity_tracker = IntegrityTracker()
     latency_detector = LatencySpikeDetector()
     drift_writer = DriftSampleWriter(DRIFT_SAMPLE_FILE)
@@ -388,45 +387,65 @@ async def consumer_forensics(bus: BusLike, print_every_s: float = 10.0) -> None:
         event = await q.get()
         counters.processed += 1
 
-        flight_recorder.record(event)
+        # Track P1->P2 latency for metrics
+        ingest_ts = event.get("ingest_ts_ms", 0)
+        recv_ts = event.get("recv_ts_ms", 0)
+        latency_ms = (recv_ts - ingest_ts) if (ingest_ts and recv_ts) else None
+        record_event(latency_ms)
 
+        flight_recorder.record(event)  # Always feed flight recorder
+
+        # Schema drift detection
         drift_result = check_schema_drift(event)
         if drift_result.is_drift:
             counters.drift += 1
-            drift_writer.write(event, drift_result)
+            drift_writer.write(event, drift_result)  # Sample drift events to disk
+            record_anomaly("drift")
 
+        # Data integrity checks (per-symbol)
         is_dup, is_ooo, is_gap = integrity_tracker.check(event)
         if is_dup:
             counters.duplicates += 1
+            record_anomaly("duplicate")
         if is_ooo:
             counters.out_of_order += 1
+            record_anomaly("ooo")
         if is_gap:
             counters.gaps += 1
+            record_anomaly("gap")
 
-        ingest_ts = event.get("ingest_ts_ms", 0)
-        recv_ts = event.get("recv_ts_ms", 0)
+        # Latency spike detection (p99 over rolling window)
         if ingest_ts and recv_ts:
             is_spike = latency_detector.add_sample(ingest_ts, recv_ts)
             if is_spike:
                 counters.spikes += 1
+                record_anomaly("latency_spike")
                 triggered = flight_recorder.trigger(
                     f"latency_spike_p99={latency_detector.get_p99()}ms"
                 )
                 if triggered:
                     counters.incidents = flight_recorder.incidents_captured
+                    record_incident()
 
+        # Trigger incident captures on critical anomalies
         if is_dup:
-            flight_recorder.trigger("duplicate_detected")
+            triggered = flight_recorder.trigger("duplicate_detected")
             counters.incidents = flight_recorder.incidents_captured
+            if triggered:
+                record_incident()
 
         if is_gap:
-            flight_recorder.trigger(f"sequence_gap")
+            triggered = flight_recorder.trigger("sequence_gap")
             counters.incidents = flight_recorder.incidents_captured
+            if triggered:
+                record_incident()
 
+        # Periodic stats logging
         now = time.monotonic()
         if (now - last_print) >= print_every_s:
-            log.info(
-                f"FORENSICS | processed={counters.processed} | drift={counters.drift} | "
+            log.log(
+                "FORENSICS",
+                f"processed={counters.processed} | drift={counters.drift} | "
                 f"dup={counters.duplicates} | ooo={counters.out_of_order} | gaps={counters.gaps} | "
                 f"spikes={counters.spikes} | incidents={counters.incidents}"
             )

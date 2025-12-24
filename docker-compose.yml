@@ -1,13 +1,29 @@
 services:
-  p2:
+  processor:
     build:
       context: ./services
-      dockerfile: p2/Dockerfile
-    container_name: mercurystream-p2
+      dockerfile: processor/Dockerfile
+    container_name: mercurystream-processor
     ports:
       - "9001:9001"
+      - "9090:9090"
     volumes:
       - ./data:/app/data
+    environment:
+      - LOG_LEVEL=INFO
+      - TZ=America/New_York
+      - METRICS_PORT=9090
+    networks:
+      - mercury
+    restart: unless-stopped
+
+  ingester:
+    build:
+      context: ./services
+      dockerfile: ingester/Dockerfile
+    container_name: mercurystream-ingester
+    depends_on:
+      - processor
     environment:
       - LOG_LEVEL=INFO
       - TZ=America/New_York
@@ -15,19 +31,57 @@ services:
       - mercury
     restart: unless-stopped
 
-  p1:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mercurystream-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    networks:
+      - mercury
+    depends_on:
+      - processor
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mercurystream-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=mercury
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - mercury
+    depends_on:
+      - prometheus
+
+  processor-replay:
     build:
       context: ./services
-      dockerfile: p1/Dockerfile
-    container_name: mercurystream-p1
-    depends_on:
-      - p2
+      dockerfile: processor/Dockerfile
+    container_name: mercurystream-processor-replay
+    ports:
+      - "9002:9001"
+      - "9092:9090"
+    volumes:
+      - ./data/replay-incidents:/app/data/incidents
     environment:
       - LOG_LEVEL=INFO
       - TZ=America/New_York
+      - METRICS_PORT=9090
     networks:
       - mercury
-    restart: unless-stopped
+    profiles:
+      - replay
 
 networks:
   mercury:
