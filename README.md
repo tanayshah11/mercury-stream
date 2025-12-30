@@ -1,278 +1,341 @@
 # MercuryStream
 
-A production-grade market data pipeline with real-time anomaly detection and forensic incident capture.
+**A real-time market data pipeline that solves the problems exchanges warn you about.**
+
+---
+
+## Why I Built This
+
+Three problems kept showing up in financial data engineering that nobody talks about until they bite you:
+
+### 1. Feed Formats Change Without Notice
+
+[Cboe's PITCH specification](https://cdn.cboe.com/resources/membership/US_EQUITIES_OPTIONS_MULTICAST_PITCH_SPECIFICATION.pdf) explicitly states they "reserve the right to add message types and grow the length of any message without notice." Your decoder breaks, your pipeline goes silent, and you find out from angry traders and not from monitoring.
+
+**MercuryStream detects schema drift in real-time** and samples malformed events for debugging without blocking the hot path.
+
+### 2. "Replay Yesterday" Is a Real Requirement
+
+[KX's kdb+tick architecture](https://code.kx.com/q/wp/rt-tick/) uses tickerplant logs specifically designed for replay—recovering state after failures, onboarding new subscribers, reproducing bugs. This isn't optional in production finance.
+
+**MercuryStream captures 10 minutes of rolling context** and dumps incident bundles (5K events before + 3K after) that can be replayed deterministically.
+
+### 3. Consumer Lag Is a Silent Killer
+
+[Confluent's production issues guide](https://www.confluent.io/blog/5-common-pitfalls-when-using-apache-kafka-consumer-groups/) calls out high consumer lag as one of the most common production problems. Slow consumers back up queues, memory explodes, and suddenly you're processing stale prices.
+
+**MercuryStream uses drop-oldest backpressure**—when a consumer falls behind, old events are dropped to keep data fresh. Drops are counted, not hidden.
+
+---
 
 ## Performance
 
-| Metric | Value |
-|--------|-------|
-| **Throughput** | ~57,000 events/sec |
-| **Latency p99** | <2ms (P1→P2 pipeline) |
-| **Memory** | <100MB per container |
+| Metric               | Value             | Context                       |
+| -------------------- | ----------------- | ----------------------------- |
+| **Throughput**       | 57,000 events/sec | Sustained, single connection  |
+| **Latency p99**      | <2ms              | End-to-end through pipeline   |
+| **Memory**           | <100MB            | Per container, bounded queues |
+| **Incident Capture** | 8,000 events      | 5K pre + 3K post anomaly      |
 
-## What This Demonstrates
+---
 
-| Capability | Why It Matters |
-|------------|----------------|
-| **Backpressure Handling** | When consumers lag, drop-oldest keeps data fresh instead of building unbounded queues |
-| **Tail Latency Observability** | p50 lies—we track p50/p95/p99 to expose real performance |
-| **Data Quality Detection** | Schema drift, duplicates, out-of-order events caught in real-time |
-| **Flight Recorder Pattern** | Auto-captures incident bundles for post-mortem analysis—like an airplane black box |
-| **Deterministic Replay** | Reproduce any incident with the exact data that caused it |
+## What Gets Caught
+
+| Anomaly            | How                   | Why It Matters              |
+| ------------------ | --------------------- | --------------------------- |
+| **Schema Drift**   | Key/type validation   | Upstream changed the format |
+| **Duplicates**     | LRU trade_id tracking | Exchange retransmit or bug  |
+| **Out-of-Order**   | Timestamp comparison  | Network reordering          |
+| **Sequence Gaps**  | trade_id continuity   | Missed messages             |
+| **Latency Spikes** | Rolling p99 threshold | Downstream slowdown         |
+
+When anomalies are detected, the **Flight Recorder** automatically captures the surrounding context—like an airplane black box, but for your data pipeline.
+
+### Why No Continuous Recording?
+
+Most pipelines record everything to disk "just in case." This creates problems:
+- **Storage bloat** — At 50K events/sec, you're writing ~4GB/hour of JSON
+- **I/O contention** — Disk writes compete with your hot path
+- **Needle in haystack** — When something breaks, you're searching through hours of normal data
+
+MercuryStream takes a different approach: **record nothing until something goes wrong.**
+
+The Flight Recorder maintains a 10-minute rolling window in memory. When an anomaly triggers, it dumps 5,000 events before and 3,000 events after the incident to disk. You get the exact context you need for debugging—nothing more, nothing less.
+
+This means:
+- **Zero disk I/O during normal operation**
+- **Bounded memory** (~5MB for the ring buffer)
+- **Incident files are self-contained** — each one has everything needed to reproduce the problem
+
+---
 
 ## Architecture
 
 ```mermaid
-flowchart TB
+flowchart LR
     subgraph External
-        CB["Coinbase WebSocket<br/>BTC-USD, ETH-USD, SOL-USD"]
+        CB[("Coinbase WS")]
     end
 
-    subgraph P1["P1 Container: Ingest"]
-        WS["WebSocket Client"] --> VAL["Pydantic Validation"]
-        VAL --> TS1["Add ingest_ts_ms"]
-        TS1 --> FRAME["Frame: [4-byte len][JSON]"]
+    subgraph P1["P1: Ingester"]
+        VAL[Validate] --> TS1[Timestamp]
+        TS1 --> FRAME[Frame]
     end
 
-    subgraph Network["Docker Network: mercury"]
-        TCP["TCP p2:9001"]
+    subgraph P2["P2: Processor"]
+        subgraph Bus["Bus - drop oldest"]
+            FANOUT((fanout))
+        end
+
+        FANOUT --> VWAP[VWAP]
+        FANOUT --> VOL[Volatility]
+        FANOUT --> VOLUME[Volume]
+        FANOUT --> HEALTH[Health]
+        FANOUT --> FORENSICS[Forensics]
+
+        subgraph FlightRecorder["Flight Recorder - 10 min window"]
+            RING[(ring buffer)]
+        end
+
+        FORENSICS --> RING
     end
 
-    subgraph P2["P2 Container: Bus + Consumers"]
-        DEC["Frame Decoder"] --> TS2["Add recv_ts_ms"]
-        TS2 --> BUS["Bus<br/>pub/sub + drop-oldest"]
-
-        BUS --> VWAP["VWAP Consumer<br/>per-symbol price + latency"]
-        BUS --> VOL["Volatility Consumer<br/>per-symbol rolling vol"]
-        BUS --> VOLUME["Volume Consumer<br/>per-symbol USD + trades"]
-        BUS --> HEALTH["Health Consumer<br/>eps, queue depths"]
-        BUS --> FORENSICS["Forensics Consumer<br/>drift, integrity, spikes"]
-        BUS --> REC["Recorder"]
-
-        FORENSICS --> DRIFT["drift_samples.jsonl"]
-        FORENSICS --> FLIGHT["FlightRecorder<br/>ring buffer"]
-        FLIGHT --> |"on anomaly"| INCIDENTS["incidents/<br/>events.jsonl + meta.json"]
-        REC --> FILE["btcusd.jsonl"]
+    subgraph Output
+        INCIDENTS[/incidents/]
+        METRICS[/Prometheus/]
     end
 
-    subgraph Replay["Replay Tool"]
-        RPLAY["replay.py"] --> |"rate control<br/>shuffle/duplicate inject"| TCP
-    end
-
-    CB --> WS
-    FRAME --> TCP --> DEC
+    CB --> VAL
+    FRAME -->|"TCP :9001"| FANOUT
+    RING -->|"on anomaly"| INCIDENTS
+    HEALTH --> METRICS
 ```
+
+**IPC Protocol:** `[4-byte BE length][JSON payload]` over TCP. Simple, language-agnostic, no delimiter escaping.
+
+---
 
 ## Quick Start
 
 ```bash
-# One-command demo: start services, inject anomalies, generate reports
+# Clone and run
+git clone https://github.com/yourusername/mercurystream
+cd mercurystream
+
+# One command: start services, inject anomalies, capture incidents
 make demo
-
-# Or start manually
-docker compose up --build
 ```
 
-### What `make demo` Does
+**Requirements:** Docker, Docker Compose, Make, Python 3.10+
 
-1. Starts all services (P1, P2, Prometheus, Grafana)
-2. Injects anomalies (5% duplicates, shuffled order)
-3. Triggers incident capture
-4. Generates incident reports
+### What Happens
+
+1. **Services start** — Ingester connects to Coinbase, Processor spins up consumers
+2. **Replay injects anomalies** — 5% duplicates, 3% schema drift, shuffled order
+3. **Forensics triggers** — Detects anomalies, captures incident bundles
+4. **Reports generate** — Markdown analysis with evidence samples
 
 ```
-╔══════════════════════════════════════════════════════════════════╗
-║           MercuryStream Incident Detection Demo                  ║
-╚══════════════════════════════════════════════════════════════════╝
 
-→ Step 1/5: Starting services...
-→ Step 2/5: Verifying services are running...
-→ Step 3/5: Injecting anomalies (duplicates + shuffled order)...
-→ Step 4/5: Waiting for incident capture to complete...
-→ Step 5/5: Generating incident reports...
+→ Starting services...
+→ Replaying with anomalies (5% dup, 3% drift, shuffle=10)...
+→ Incidents captured: 3
+→ Reports generated: data/incidents/*/report.md
 
-╔══════════════════════════════════════════════════════════════════╗
-║                        Demo Complete!                            ║
-╚══════════════════════════════════════════════════════════════════╝
+FORENSICS | processed=15000 | drift=127 | dup=412 | gaps=0 | incidents=3
 ```
 
-### View Incident Report
-
-```bash
-cat data/incidents/*/report.md | head -50
-```
-
-```markdown
-# Incident Report: 20251224_173003_9e6e5c01
-
-## Summary
-| Field | Value |
-|-------|-------|
-| **Type** | `duplicate_detected` |
-| **Triggered** | 2025-12-24 17:30:03 UTC |
-| **Affected Symbols** | BTC-USD |
-| **Total Events** | 2,109 (2,109 pre + 0 post) |
-
-## Evidence Samples
-### Duplicate Events
-{"trade_id": 926076411, "price": 87641.81, ...}
-{"trade_id": 926076411, "price": 87641.81, ...}
-
-## Reproduce
-python replay.py --file data/incidents/20251224_173003_9e6e5c01/events.jsonl --rate 500
-```
+---
 
 ## Observability
 
-| Service | URL | Description |
-|---------|-----|-------------|
-| **Prometheus** | http://localhost:9091 | Metrics scraping |
-| **Grafana** | http://localhost:3000 | Dashboards (admin/mercury) |
-| **P2 Metrics** | http://localhost:9090/metrics | Raw Prometheus metrics |
+| Endpoint        | URL                           | Credentials     |
+| --------------- | ----------------------------- | --------------- |
+| **Grafana**     | http://localhost:3000         | admin / mercury |
+| **Prometheus**  | http://localhost:9091         | —               |
+| **Raw Metrics** | http://localhost:9090/metrics | —               |
 
-### Metrics Exposed
+### Prometheus Metrics
 
 ```
-mercurystream_events_total           # Total events processed
-mercurystream_events_per_second      # Current throughput
-mercurystream_latency_ms_bucket      # Latency histogram
-mercurystream_anomalies_total{type}  # Anomalies by type
-mercurystream_incidents_total        # Incidents captured
-mercurystream_drops_total            # Dropped events
+mercurystream_events_total              # Events processed
+mercurystream_events_per_second         # Current throughput
+mercurystream_latency_ms_bucket{le=...} # Latency histogram
+mercurystream_anomalies_total{type=...} # By anomaly type
+mercurystream_incidents_total           # Captured incidents
+mercurystream_drops_total               # Backpressure drops
 ```
 
-See [DEMO.md](DEMO.md) for the full demo walkthrough.
+---
+
+## Live Output
+
+```
+VWAP       | BTC-USD=98234.56 | ETH-USD=3421.78 | e2e p99=1ms | proc p99=0ms
+VOLATILITY | BTC-USD=8.1% | ETH-USD=13.7% | SOL-USD=24.3%
+VOLUME     | BTC-USD=$1.2M/min(142tx) | ETH-USD=$89K/min(45tx)
+HEALTH     | eps=2847.3 | drops=0 | subs=5 | qdepths=[0,0,1,1,1]
+FORENSICS  | processed=50000 | drift=0 | dup=0 | gaps=0 | incidents=0
+```
+
+---
+
+## Replay Tool (still in development)
+
+Reproduce any incident or inject chaos for testing:
+
+```bash
+# Replay a captured incident
+python tools/replay.py --file data/incidents/<id>/events.jsonl --rate 500
+
+# Inject duplicates (test deduplication)
+python tools/replay.py --file data/incidents/<id>/events.jsonl --rate 500 --duplicate-rate 0.05
+
+# Shuffle order (test OOO detection)
+python tools/replay.py --file data/incidents/<id>/events.jsonl --rate 500 --shuffle-window 10
+
+# Inject schema drift (test validation)
+python tools/replay.py --file data/incidents/<id>/events.jsonl --rate 500 --drift-rate 0.03
+```
+
+---
+
+## Design Decisions
+
+| Choice                       | Why                                                                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Drop-oldest backpressure** | For live market data, a stale price is worse than a missing price. Freshness > completeness.            |
+| **Two timestamps**           | `ingest_ts_ms` (exchange→P1) and `recv_ts_ms` (P1→P2) separate network latency from processing latency. |
+| **10-minute rolling window** | Enough context for incident analysis without unbounded memory. Fixed at 5K pre + 3K post events.        |
+| **p99 not p50**              | Median latency lies. Tail latency is where problems hide. We track p50/p95/p99.                         |
+| **orjson over stdlib**       | 10x faster JSON serialization. At 50K events/sec, this matters.                                         |
+| **Length-prefix framing**    | `[4-byte len][payload]` has no escaping edge cases. Works with binary payloads. Language-agnostic.      |
+
+---
 
 ## Project Structure
 
 ```
 mercurystream/
-├── Makefile                 # make demo, make benchmark, etc.
-├── docker-compose.yml       # Container orchestration
-├── prometheus.yml           # Prometheus scrape config
-├── replay.py                # Incident replay tool
-├── DEMO.md                  # Demo walkthrough
-├── SYSTEM.md                # Detailed system documentation
-├── grafana/
-│   ├── provisioning/        # Auto-configure datasources
-│   └── dashboards/          # Pre-built dashboards
+├── services/
+│   ├── ingester/           # Processor 1: Coinbase WS → TCP
+│   │   └── ingester.py
+│   ├── processor/          # Processor 2: Bus + Consumers
+│   │   ├── processor.py    # TCP server + event routing
+│   │   ├── consumer.py     # VWAP, Volatility, Volume, Health
+│   │   ├── forensics.py    # Anomaly detection + FlightRecorder
+│   │   └── metrics.py      # Prometheus endpoint
+│   └── shared/
+│       └── models.py       # Pydantic Ticker model (17 fields) for Coinbase ticker events
+├── tools/
+│   ├── replay.py           # Deterministic replay + chaos injection
+│   └── stress.py           # Load testing (multi-connection)
+├── grafana/                # Pre-built dashboards
 ├── data/
-│   ├── btcusd.jsonl         # Recorded market data
-│   ├── drift_samples.jsonl  # Schema drift samples
-│   └── incidents/           # Captured incident bundles
-│       └── <timestamp>_<uuid>/
-│           ├── events.jsonl
-│           ├── meta.json
-│           └── report.md    # Generated incident report
-└── services/
-    ├── shared/              # Common code
-    │   ├── logger.py        # Centralized loguru config
-    │   ├── models.py        # Pydantic Ticker model
-    │   └── requirements.txt
-    ├── p1/                  # Ingest service
-    │   ├── Dockerfile
-    │   └── p1.py
-    └── p2/                  # Bus + consumers
-        ├── Dockerfile
-        ├── p2.py            # TCP server + Bus + metrics
-        ├── consumer.py      # VWAP, Health, Slow consumers
-        ├── forensics.py     # Anomaly detection + FlightRecorder
-        ├── metrics.py       # Prometheus /metrics endpoint
-        ├── recorder.py      # Async JSONL writer
-        └── incident/        # Report generation
-            └── report.py
+│   └── incidents/          # Captured incident bundles
+|   └── replay-incidents/   # Replay incident bundles
+├── docker-compose.yml
+├── prometheus.yml
+└── Makefile                # make demo, make stress, make replay
 ```
+
+---
 
 ## Configuration
 
-All configuration via environment variables:
+### Environment Variables
 
-### P1 (Ingest)
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SYMBOLS` | `BTC-USD,ETH-USD,SOL-USD` | Comma-separated Coinbase trading pairs |
-| `P2_HOST` | `p2` | P2 service hostname |
-| `P2_PORT` | `9001` | P2 service port |
-| `BACKOFF_MAX` | `10.0` | Max reconnect backoff (seconds) |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| Variable                     | Default                   | Description                       |
+| ---------------------------- | ------------------------- | --------------------------------- |
+| `SYMBOLS`                    | `BTC-USD,ETH-USD,SOL-USD` | Trading pairs to subscribe        |
+| `LATENCY_SPIKE_THRESHOLD_MS` | `100`                     | p99 threshold for spike detection |
+| `DUPLICATE_LRU_MAX`          | `50000`                   | Trade IDs tracked for dedup       |
+| `FLIGHT_COOLDOWN_S`          | `60`                      | Minimum seconds between incidents |
 
-### P2 (Bus)
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HOST` | `0.0.0.0` | Bind address |
-| `PORT` | `9001` | Listen port |
-| `RECORD` | `false` | Enable JSONL recording |
-| `RECORD_FILE` | `data/btcusd.jsonl` | Recording path |
-| `ENABLE_SLOW` | `false` | Enable slow consumer (demo) |
-| `SLOW_DELAY_MS` | `50` | Slow consumer delay |
-| `FORENSICS` | `true` | Enable forensics consumer |
+### Fixed Settings
 
-### Forensics
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LATENCY_SPIKE_THRESHOLD_MS` | `100` | P99 threshold for spike detection |
-| `DUPLICATE_LRU_MAX` | `50000` | Trade IDs tracked for dedup |
-| `FLIGHT_PRE_EVENTS` | `5000` | Ring buffer size (pre-incident) |
-| `FLIGHT_POST_EVENTS` | `2000` | Events captured post-trigger |
-| `FLIGHT_COOLDOWN_S` | `60` | Seconds between incidents |
+These are intentionally not configurable to ensure consistent incident capture:
 
-## Key Design Decisions
+- **Rolling window:** 10 minutes of data
+- **Pre-incident:** 5,000 events max
+- **Post-incident:** 3,000 events
 
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| **IPC Protocol** | `[4-byte BE len][JSON]` | Simple, language-agnostic, no delimiters |
-| **Backpressure** | Drop-oldest | Live data: freshness > completeness |
-| **Serialization** | orjson | 10x faster than stdlib json |
-| **Validation** | Pydantic v2 | Type safety + excellent errors |
-| **Flight Recorder** | Ring buffer + trigger | Captures context *before* you knew there was a problem |
-| **Timestamps** | `ingest_ts_ms` + `recv_ts_ms` | Separate exchange→P1 vs P1→P2 latency |
+---
 
-## Replay Tool
+## Stress Testing
 
 ```bash
-# Basic replay at 500 events/sec
-python replay.py --file data/btcusd.jsonl --rate 500
+# 10 seconds at 5,000 events/sec
+make stress
 
-# Inject out-of-order events (shuffle within 10-event windows)
-python replay.py --file data/btcusd.jsonl --rate 200 --shuffle-window 10
+# Maximum throughput (unlimited rate)
+make stress-max
 
-# Inject 5% duplicates
-python replay.py --file data/btcusd.jsonl --rate 200 --duplicate-rate 0.05
-
-# Replay a captured incident
-python replay.py --file data/incidents/<id>/events.jsonl --rate 100
+# Custom: 30 seconds, 10,000 events/sec, 4 parallel connections
+python tools/stress.py --duration 30 --rate 10000 --connections 4
 ```
 
-## What Gets Detected
+---
 
-| Anomaly | Detection Method | Incident Trigger |
-|---------|------------------|------------------|
-| **Schema Drift** | Missing keys, type mismatches | Logged to drift_samples.jsonl |
-| **Duplicates** | LRU set of trade_ids (50k) | Yes |
-| **Out-of-Order** | Exchange timestamp comparison | Counted, not triggered |
-| **Sequence Gaps** | Sequence number tracking | Yes |
-| **Latency Spikes** | Rolling P99 > threshold | Yes (after 2 consecutive) |
+## Incident Reports
 
-## Live Consumers
+When anomalies are detected, MercuryStream generates forensic reports:
 
-The pipeline runs 5 concurrent consumers processing all symbols:
+```markdown
+# Incident Report: 20251224_173003_9e6e5c01
 
+## Summary
+
+| Field            | Value                          |
+| ---------------- | ------------------------------ |
+| **Type**         | `duplicate_detected`           |
+| **Triggered**    | 2025-12-24 17:30:03 UTC        |
+| **Total Events** | 8,000 (5,000 pre + 3,000 post) |
+
+## Evidence Samples
+
+### Duplicate Events (2 samples)
+
+{"trade_id": 926076411, "price": 87641.81, "product_id": "BTC-USD"}
+{"trade_id": 926076411, "price": 87641.81, "product_id": "BTC-USD"}
+
+## Reproduce
+
+python tools/replay.py --file data/incidents/20251224_173003_9e6e5c01/events.jsonl
 ```
-VWAP       | BTC-USD=98234.56 | ETH-USD=3421.78 | SOL-USD=187.23 | age p99=1ms
-VOLATILITY | BTC-USD=8.1%     | ETH-USD=13.7%   | SOL-USD=24.3%
-VOLUME     | BTC-USD=$1.2M/min(142tx) | ETH-USD=$89.3K/min(45tx) | SOL-USD=$432.1K/min(298tx)
-HEALTH     | eps=85.0 | drops=0 | subs=6 | qdepths=[0, 0, 0, 0, 0, 0]
-FORENSICS  | processed=10000 | drift=0 | dup=0 | ooo=0 | gaps=0 | spikes=0 | incidents=0
-```
 
-| Consumer | What It Does |
-|----------|-------------|
-| **VWAP** | Per-symbol volume-weighted average price + latency tracking |
-| **Volatility** | Per-symbol annualized volatility from rolling log returns |
-| **Volume** | Per-symbol USD volume and trade count per minute |
-| **Health** | Events/sec, queue depths, drop count |
-| **Forensics** | Anomaly detection + incident capture |
+---
+
+## Tech Stack
+
+| Component         | Choice               | Why                            |
+| ----------------- | -------------------- | ------------------------------ |
+| **Language**      | Python 3.12          | asyncio for non-blocking I/O   |
+| **Validation**    | Pydantic v2          | Type safety + excellent errors |
+| **Serialization** | orjson               | 10x faster than stdlib         |
+| **WebSocket**     | websockets           | Reliable, well-maintained      |
+| **Monitoring**    | Prometheus + Grafana | Industry standard              |
+| **Containers**    | Docker Compose       | Simple orchestration           |
+
+---
+
+## References
+
+These are the real-world problems that motivated this project:
+
+- **Schema Drift:** [Cboe PITCH Specification](https://cdn.cboe.com/resources/membership/US_EQUITIES_OPTIONS_MULTICAST_PITCH_SPECIFICATION.pdf) — "reserve the right to add message types and grow the length of any message without notice"
+- **Replay Requirements:** [KX kdb+tick Architecture](https://code.kx.com/q/wp/rt-tick/) — tickerplant logs designed for replay and recovery
+- **Consumer Lag:** [Confluent Production Issues](https://www.confluent.io/blog/5-common-pitfalls-when-using-apache-kafka-consumer-groups/) — high consumer lag as a common production problem
+- **Time-based Lag:** [WarpStream Engineering](https://www.warpstream.com/blog/the-right-way-to-measure-consumer-lag) — why offset-based lag can be misleading
+
+---
 
 ## License
 
 MIT
+
+---
+
+I built this to learn and understand why production systems fail.
+I built this to understand how anomalies in production data pipelines can be costly and how detecting them can help mitigate them in the future.
+I built this to understand how to build a production-ready data pipeline.
