@@ -1,3 +1,5 @@
+> 📝 **Architecture write-up & engineer's notes:** [tanayshah.dev/projects/mercury-stream/](https://tanayshah.dev/projects/mercury-stream/) — by [Tanay Shah](https://tanayshah.dev/), AI engineer in NYC.
+
 # MercuryStream
 
 **A real-time market data pipeline that solves the problems exchanges warn you about.**
