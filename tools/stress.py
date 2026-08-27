@@ -43,31 +43,19 @@ def frame(payload: bytes) -> bytes:
 
 @dataclass
 class Stats:
-    """Track sent events, errors, and latency distributions"""
+    """Track sent events, errors, and throughput"""
     sent: int = 0
     errors: int = 0
     start_time: float = 0.0
-    latencies: list[float] = field(default_factory=list)
 
-    def record_send(self, latency_ms: float) -> None:
-        """Increment sent count and cap latency samples at 100k to prevent memory bloat"""
+    def record_send(self) -> None:
+        """Increment sent count"""
         self.sent += 1
-        if len(self.latencies) < 100000:
-            self.latencies.append(latency_ms)
 
     def throughput(self) -> float:
         """Calculate events per second"""
         elapsed = time.monotonic() - self.start_time
         return self.sent / elapsed if elapsed > 0 else 0
-
-    def percentile(self, p: float) -> float:
-        """Calculate percentile from latency samples (p=50 for median, p=99 for p99)"""
-        if not self.latencies:
-            return 0.0
-        sorted_lat = sorted(self.latencies)
-        idx = int(len(sorted_lat) * p / 100)
-        idx = min(idx, len(sorted_lat) - 1)
-        return sorted_lat[idx]
 
     def report(self) -> str:
         elapsed = time.monotonic() - self.start_time
@@ -75,61 +63,95 @@ class Stats:
             f"sent={self.sent} | "
             f"errors={self.errors} | "
             f"throughput={self.throughput():.0f}/s | "
-            f"p50={self.percentile(50):.2f}ms | "
-            f"p95={self.percentile(95):.2f}ms | "
-            f"p99={self.percentile(99):.2f}ms | "
             f"elapsed={elapsed:.1f}s"
         )
+        # Note: Pipeline latency is measured by the consumer, not here.
+        # We only measure sender-side throughput.
 
 
-def generate_event(seq: int, symbol: str | None = None) -> dict:
-    """Generate synthetic market event with realistic price movements"""
-    sym = symbol or random.choice(SYMBOLS)
-    base_price = {"BTC-USD": 95000, "ETH-USD": 3500, "SOL-USD": 200}.get(sym, 100)
-    # Add small gaussian noise (0.1% std dev) to simulate price fluctuations
-    price = base_price * (1 + random.gauss(0, 0.001))
-    # Exponential distribution for trade sizes (realistic for order book)
-    size = random.expovariate(1) * 0.1
+class EventGenerator:
+    """Generates synthetic events with per-symbol sequential trade_ids."""
 
-    return {
-        "type": "ticker",
-        "product_id": sym,
-        "price": round(price, 2),
-        "last_size": round(size, 8),
-        "time": time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime()),
-        "trade_id": 900000000 + seq,
-        "sequence": seq,
-        "ingest_ts_ms": now_ms(),
-    }
+    def __init__(self, feeder_id: str = "stress-0", base_trade_id: int = 900_000_000):
+        self.feeder_id = feeder_id
+        # Track trade_id per symbol to avoid false gap detection
+        self.trade_ids: dict[str, int] = {sym: base_trade_id for sym in SYMBOLS}
+
+    def generate(self, symbol: str | None = None) -> dict:
+        """Generate synthetic market event with realistic price movements"""
+        sym = symbol or random.choice(SYMBOLS)
+        base_price = {"BTC-USD": 95000, "ETH-USD": 3500, "SOL-USD": 200}.get(sym, 100)
+        # Add small gaussian noise (0.1% std dev) to simulate price fluctuations
+        price = base_price * (1 + random.gauss(0, 0.001))
+        # Exponential distribution for trade sizes (realistic for order book)
+        size = random.expovariate(1) * 0.1
+
+        # Get next trade_id for this symbol (sequential per symbol)
+        trade_id = self.trade_ids.get(sym, 900_000_000)
+        self.trade_ids[sym] = trade_id + 1
+
+        # Generate realistic bid-ask spread (0.01-0.1% of price)
+        spread = price * random.uniform(0.0001, 0.001)
+        best_bid = price - spread / 2
+        best_ask = price + spread / 2
+
+        # Generate 24h stats with realistic bounds
+        open_24h = price * (1 + random.gauss(0, 0.02))  # 2% std dev from current
+        high_24h = max(price, open_24h) * (1 + random.uniform(0, 0.03))
+        low_24h = min(price, open_24h) * (1 - random.uniform(0, 0.03))
+
+        # Realistic daily volume (varies by asset)
+        volume_scale = {"BTC-USD": 10000, "ETH-USD": 50000, "SOL-USD": 100000}.get(sym, 10000)
+        volume_24h = random.uniform(0.5, 1.5) * volume_scale
+
+        return {
+            "type": "ticker",
+            "product_id": sym,
+            "price": round(price, 2),
+            "last_size": round(size, 8),
+            "side": random.choice(["buy", "sell"]),
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime()),
+            "trade_id": trade_id,
+            "sequence": trade_id,  # Use same as trade_id for consistency
+            # 24-hour stats
+            "open_24h": round(open_24h, 2),
+            "high_24h": round(high_24h, 2),
+            "low_24h": round(low_24h, 2),
+            "volume_24h": round(volume_24h, 2),
+            "volume_30d": round(volume_24h * 30, 2),  # Approximate
+            # Top-of-book
+            "best_bid": round(best_bid, 2),
+            "best_bid_size": round(random.expovariate(1) * 0.5, 8),
+            "best_ask": round(best_ask, 2),
+            "best_ask_size": round(random.expovariate(1) * 0.5, 8),
+            "feeder_id": self.feeder_id,
+            "ingest_ts_ms": now_ms(),
+        }
 
 
 class RateLimiter:
-    """Token bucket rate limiter to control event throughput"""
+    """Simple interval-based rate limiter for accurate throughput control"""
     def __init__(self, rate: float) -> None:
         self.rate = rate
-        self.tokens = 0.0  # Available tokens
-        self.last_time = time.monotonic()
+        self.interval = 1.0 / rate if rate > 0 else 0  # Time between events
+        self.next_time = time.monotonic()  # When we can send next
 
     async def acquire(self) -> None:
-        """Block until a token is available, implementing token bucket algorithm"""
+        """Wait until it's time to send the next event"""
         if self.rate <= 0:  # Unlimited rate
             return
 
         now = time.monotonic()
-        elapsed = now - self.last_time
-        # Refill tokens based on elapsed time
-        self.tokens += elapsed * self.rate
-        self.tokens = min(self.tokens, 10.0)  # Cap burst to 10 tokens max
-        self.last_time = now
+        if now < self.next_time:
+            # Not yet time - wait for the remaining interval
+            await asyncio.sleep(self.next_time - now)
 
-        if self.tokens < 1.0:
-            # Not enough tokens, sleep until we have one
-            wait_time = (1.0 - self.tokens) / self.rate
-            await asyncio.sleep(wait_time)
-            self.tokens = 0.0
-        else:
-            # Consume one token
-            self.tokens -= 1.0
+        # If we fell behind (next_time is in the past), catch up
+        if self.next_time < time.monotonic():
+            self.next_time = time.monotonic()
+
+        # Schedule next send time (from target, not actual, to prevent drift)
+        self.next_time += self.interval
 
 
 async def stress_test(
@@ -140,8 +162,15 @@ async def stress_test(
     count: int | None,
     symbol: str | None,
     batch_size: int,
+    connection_id: int = 0,  # Unique ID per connection to avoid duplicate sequences
 ) -> Stats:
     """Send events to P2 via TCP connection, respecting rate limits"""
+    feeder_id = f"stress-{connection_id}"
+    # Each connection gets unique base trade_id range to avoid collisions
+    # Use 10M spacing to support up to 100 connections safely (vs 100M which only supports 10)
+    base_trade_id = 900_000_000 + (connection_id * 10_000_000)
+    generator = EventGenerator(feeder_id=feeder_id, base_trade_id=base_trade_id)
+
     stats = Stats()
     stats.start_time = time.monotonic()
 
@@ -153,7 +182,6 @@ async def stress_test(
         return stats
 
     rate_limiter = RateLimiter(rate)
-    seq = 0
     last_report = time.monotonic()
 
     def should_continue() -> bool:
@@ -166,30 +194,26 @@ async def stress_test(
 
     try:
         while should_continue():
-            batch_start = time.monotonic()
-
             # Process events in batches to reduce loop overhead
             for _ in range(batch_size):
                 if not should_continue():
                     break
 
-                event = generate_event(seq, symbol)
-                seq += 1
+                # Rate limit BEFORE sending to control throughput accurately
+                if rate > 0:
+                    await rate_limiter.acquire()
 
-                send_start = time.monotonic()
+                event = generator.generate(symbol)
+
                 try:
                     # Serialize and send: orjson -> frame with length prefix -> TCP
                     payload = orjson.dumps(event)
                     writer.write(frame(payload))
-                    await writer.drain()  # Ensure sent before measuring latency
-                    latency = (time.monotonic() - send_start) * 1000
-                    stats.record_send(latency)
+                    await writer.drain()
+                    stats.record_send()
                 except (BrokenPipeError, ConnectionResetError):
                     stats.errors += 1
                     raise
-
-                if rate > 0:
-                    await rate_limiter.acquire()
 
             # Log stats every 2 seconds
             now = time.monotonic()
@@ -232,8 +256,9 @@ async def stress_parallel(
             count=per_conn_count,
             symbol=symbol,
             batch_size=10,
+            connection_id=i,  # Unique ID for each connection
         )
-        for _ in range(connections)
+        for i in range(connections)
     ]
 
     # Wait for all connections to complete
@@ -242,10 +267,6 @@ async def stress_parallel(
     # Aggregate stats across all connections
     total_sent = sum(s.sent for s in results)
     total_errors = sum(s.errors for s in results)
-    all_latencies = []
-    for s in results:
-        all_latencies.extend(s.latencies)
-
     elapsed = time.monotonic() - results[0].start_time if results else 0
 
     log.info("=" * 60)
@@ -256,16 +277,7 @@ async def stress_parallel(
     log.info(f"Total errors: {total_errors}")
     log.info(f"Duration:     {elapsed:.1f}s")
     log.info(f"Throughput:   {total_sent / elapsed:,.0f}/s" if elapsed > 0 else "N/A")
-
-    if all_latencies:
-        sorted_lat = sorted(all_latencies)
-        # Calculate percentiles from aggregated latencies
-        p50 = sorted_lat[int(len(sorted_lat) * 0.50)]
-        p95 = sorted_lat[int(len(sorted_lat) * 0.95)]
-        p99 = sorted_lat[min(int(len(sorted_lat) * 0.99), len(sorted_lat) - 1)]
-        log.info(f"Latency p50:  {p50:.2f}ms")
-        log.info(f"Latency p95:  {p95:.2f}ms")
-        log.info(f"Latency p99:  {p99:.2f}ms")
+    log.info("(Pipeline latency is measured by consumers, check processor logs)")
 
 
 app = typer.Typer()

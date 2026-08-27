@@ -6,7 +6,7 @@ COPY shared/ /app/shared/
 
 RUN pip install --no-cache-dir -r /app/shared/requirements.txt
 
-COPY processor/consumer.py processor/recorder.py processor/forensics.py processor/metrics.py processor/processor.py ./
+COPY processor/consumer.py processor/forensics.py processor/metrics.py processor/processor.py ./
 COPY processor/incident/ /app/incident/
 
 RUN mkdir -p /app/data

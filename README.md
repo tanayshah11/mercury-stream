@@ -56,6 +56,7 @@ When anomalies are detected, the **Flight Recorder** automatically captures the 
 ### Why No Continuous Recording?
 
 Most pipelines record everything to disk "just in case." This creates problems:
+
 - **Storage bloat** — At 50K events/sec, you're writing ~4GB/hour of JSON
 - **I/O contention** — Disk writes compete with your hot path
 - **Needle in haystack** — When something breaks, you're searching through hours of normal data
@@ -65,6 +66,7 @@ MercuryStream takes a different approach: **record nothing until something goes 
 The Flight Recorder maintains a 10-minute rolling window in memory. When an anomaly triggers, it dumps 5,000 events before and 3,000 events after the incident to disk. You get the exact context you need for debugging—nothing more, nothing less.
 
 This means:
+
 - **Zero disk I/O during normal operation**
 - **Bounded memory** (~5MB for the ring buffer)
 - **Incident files are self-contained** — each one has everything needed to reproduce the problem

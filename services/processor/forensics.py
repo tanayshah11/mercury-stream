@@ -28,8 +28,10 @@ DUPLICATE_LRU_MAX = int(os.getenv("DUPLICATE_LRU_MAX", "50000"))  # Max trade ID
 LATENCY_BUFFER_SIZE = int(os.getenv("LATENCY_BUFFER_SIZE", "3000"))  # Rolling window for p99 calculation
 LATENCY_SPIKE_THRESHOLD_MS = int(os.getenv("LATENCY_SPIKE_THRESHOLD_MS", "100"))  # p99 threshold to trigger spike
 LATENCY_SPIKE_CONSECUTIVE = int(os.getenv("LATENCY_SPIKE_CONSECUTIVE", "2"))  # Consecutive spikes needed to trigger incident
-FLIGHT_PRE_EVENTS = int(os.getenv("FLIGHT_PRE_EVENTS", "5000"))  # Ring buffer size: events before incident
-FLIGHT_POST_EVENTS = int(os.getenv("FLIGHT_POST_EVENTS", "2000"))  # Events captured after incident trigger
+# Fixed incident capture settings (not configurable)
+FLIGHT_WINDOW_SECONDS = 600  # Rolling window: keep last 10 minutes of data
+FLIGHT_PRE_EVENTS = 5000  # Max events to capture before incident trigger
+FLIGHT_POST_EVENTS = 3000  # Events to capture after incident trigger
 FLIGHT_COOLDOWN_S = int(os.getenv("FLIGHT_COOLDOWN_S", "60"))  # Prevent incident spam
 
 # Schema requirements
@@ -71,11 +73,11 @@ def check_schema_drift(event: dict) -> DriftResult:
     """Validate event schema against expected structure - detects missing/wrong types/extra fields."""
     missing = [k for k in REQUIRED_KEYS if k not in event]
     type_mismatches = {}
-    # Allow optional fields: recv_ts_ms, trade_id, sequence
+    # Allow optional fields: recv_ts_ms, trade_id, sequence, feeder_id
     unexpected = [
         k
         for k in event.keys()
-        if k not in REQUIRED_KEYS and k not in ("recv_ts_ms", "trade_id", "sequence")
+        if k not in REQUIRED_KEYS and k not in ("recv_ts_ms", "trade_id", "sequence", "feeder_id")
     ]
 
     for key, expected_type in EXPECTED_TYPES.items():
@@ -119,27 +121,40 @@ class LRUSet:
 
 @dataclass
 class SymbolState:
-    """Per-symbol tracking state for integrity checks."""
+    """Per-symbol-per-feeder tracking state for integrity checks."""
     last_exchange_ts_ms: int = 0  # For out-of-order detection
-    last_sequence: int | None = None  # For gap detection
+    last_trade_id: int | None = None  # For gap detection (trade_ids are sequential per symbol)
     trade_ids: LRUSet = field(default_factory=lambda: LRUSet(DUPLICATE_LRU_MAX))  # For duplicate detection
 
 
 class IntegrityTracker:
-    """Per-symbol data quality monitoring - detects duplicates, reordering, sequence gaps."""
+    """Per-symbol-per-feeder data quality monitoring - detects duplicates, reordering, sequence gaps.
 
-    def __init__(self) -> None:
-        self._states: dict[str, SymbolState] = {}  # Separate state per product_id
+    Tracks state per (product_id, feeder_id) to avoid false positives when multiple
+    feeders send interleaved sequences for the same symbol.
+    """
 
-    def _get_state(self, product_id: str) -> SymbolState:
-        if product_id not in self._states:
-            self._states[product_id] = SymbolState()
-        return self._states[product_id]
+    def __init__(self, max_states: int = 100) -> None:
+        self._states: OrderedDict[tuple[str, str], SymbolState] = OrderedDict()  # State per (product_id, feeder_id)
+        self._max_states = max_states  # Prevent unbounded growth
+
+    def _get_state(self, product_id: str, feeder_id: str) -> SymbolState:
+        key = (product_id, feeder_id)
+        if key not in self._states:
+            self._states[key] = SymbolState()
+            # LRU eviction: remove oldest state if exceeding max
+            if len(self._states) > self._max_states:
+                self._states.popitem(last=False)
+        else:
+            # Move to end to mark as recently used
+            self._states.move_to_end(key)
+        return self._states[key]
 
     def check(self, event: dict) -> tuple[bool, bool, bool]:
         """Returns (is_duplicate, is_out_of_order, is_gap)."""
         product_id = event.get("product_id", "unknown")
-        state = self._get_state(product_id)
+        feeder_id = event.get("feeder_id", "unknown")  # Track per feeder to avoid false positives
+        state = self._get_state(product_id, feeder_id)
 
         is_duplicate = False
         is_out_of_order = False
@@ -170,13 +185,12 @@ class IntegrityTracker:
             except (ValueError, AttributeError):
                 pass
 
-        # Gap check: is sequence number jumping by >1?
-        sequence = event.get("sequence")
-        if sequence is not None and state.last_sequence is not None:
-            if sequence > state.last_sequence + 1:
+        # Gap check: is trade_id jumping by >1? (trade_ids are sequential per symbol)
+        if trade_id is not None and state.last_trade_id is not None:
+            if trade_id > state.last_trade_id + 1:
                 is_gap = True
-        if sequence is not None:
-            state.last_sequence = sequence
+        if trade_id is not None:
+            state.last_trade_id = trade_id
 
         return is_duplicate, is_out_of_order, is_gap
 
@@ -209,6 +223,8 @@ class LatencySpikeDetector:
         # Calculate p99 from rolling window
         sorted_latencies = sorted(self._latencies)
         p99_idx = int(len(sorted_latencies) * 0.99)
+        # Prevent off-by-one error when index equals length
+        p99_idx = min(p99_idx, len(sorted_latencies) - 1)
         p99 = sorted_latencies[p99_idx]
 
         # Require consecutive spikes to avoid false positives from single outliers
@@ -228,6 +244,8 @@ class LatencySpikeDetector:
             return 0
         sorted_latencies = sorted(self._latencies)
         p99_idx = int(len(sorted_latencies) * 0.99)
+        # Prevent off-by-one error when index equals length
+        p99_idx = min(p99_idx, len(sorted_latencies) - 1)
         return sorted_latencies[p99_idx]
 
 
@@ -238,11 +256,18 @@ class DriftSampleWriter:
         self.file_path = file_path
         self._q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1000)  # Bounded queue
         self._task: asyncio.Task | None = None
+        self._shutdown = False
 
     async def start(self) -> None:
         os.makedirs(os.path.dirname(self.file_path) or ".", exist_ok=True)
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="drift_writer")
+
+    async def shutdown(self) -> None:
+        """Graceful shutdown: drain queue and close file."""
+        self._shutdown = True
+        if self._task:
+            await self._task
 
     def write(self, event: dict, drift_result: DriftResult) -> None:
         """Non-blocking write - drops sample if queue full (don't block forensics)."""
@@ -262,10 +287,13 @@ class DriftSampleWriter:
         """Background task: drain queue to disk."""
         f = open(self.file_path, "ab", buffering=65536)
         try:
-            while True:
-                line = await self._q.get()
-                await asyncio.to_thread(f.write, line)  # Offload I/O to thread pool
-                await asyncio.to_thread(f.flush)
+            while not self._shutdown or not self._q.empty():
+                try:
+                    line = await asyncio.wait_for(self._q.get(), timeout=0.5)
+                    await asyncio.to_thread(f.write, line)  # Offload I/O to thread pool
+                    await asyncio.to_thread(f.flush)
+                except asyncio.TimeoutError:
+                    continue  # Check shutdown flag
         finally:
             try:
                 f.close()
@@ -274,20 +302,16 @@ class DriftSampleWriter:
 
 
 class FlightRecorder:
-    """Black box recorder: continuous ring buffer captures N events before + M events after incidents."""
+    """Black box recorder: 10-minute rolling window + post-incident capture."""
 
     def __init__(
         self,
         incidents_dir: str = INCIDENTS_DIR,
-        pre_events: int = FLIGHT_PRE_EVENTS,
-        post_events: int = FLIGHT_POST_EVENTS,
         cooldown_s: int = FLIGHT_COOLDOWN_S,
     ) -> None:
         self.incidents_dir = incidents_dir
-        self.pre_events = pre_events
-        self.post_events = post_events
         self.cooldown_s = cooldown_s
-        self._ring: deque[dict] = deque(maxlen=pre_events)  # Circular buffer always keeps last N events
+        self._ring: deque[dict] = deque()  # Time-based rolling window (no maxlen)
         self._capturing = False  # State machine: normal -> capturing -> finalize
         self._capture_buffer: list[dict] = []
         self._capture_remaining = 0
@@ -295,15 +319,26 @@ class FlightRecorder:
         self._incident_reason = ""
         self._incident_count = 0
 
+    def _prune_old_events(self, now_ms: int) -> None:
+        """Remove events older than 10 minutes from the ring buffer."""
+        cutoff_ms = now_ms - (FLIGHT_WINDOW_SECONDS * 1000)
+        while self._ring and self._ring[0].get("ingest_ts_ms", 0) < cutoff_ms:
+            self._ring.popleft()
+
     def record(self, event: dict) -> None:
-        """Always called: feed ring buffer normally, or capture buffer during incident."""
+        """Always feed ring buffer (rolling 10-min window). Also capture during incident."""
+        now_ms = event.get("ingest_ts_ms", 0) or int(time.time() * 1000)
+
+        # Always add to ring buffer (continuous rolling window)
+        self._ring.append(event)
+        self._prune_old_events(now_ms)
+
+        # If capturing, also add to capture buffer
         if self._capturing:
-            self._capture_buffer.append(event)  # Capturing post-incident events
+            self._capture_buffer.append(event)
             self._capture_remaining -= 1
             if self._capture_remaining <= 0:
-                self._finalize_incident()  # Got enough post events, save to disk
-        else:
-            self._ring.append(event)  # Normal operation: ring buffer auto-evicts oldest
+                self._finalize_incident()
 
     def trigger(self, reason: str) -> bool:
         """Trigger incident capture. Returns True if triggered, False if on cooldown/already capturing."""
@@ -313,10 +348,12 @@ class FlightRecorder:
         if (now - self._last_incident_time) < self.cooldown_s:
             return False  # Cooldown to prevent spam
 
-        # Start capture: snapshot ring buffer (pre events) + collect post events
+        # Start capture: take last N events from ring buffer + collect M post events
         self._capturing = True
-        self._capture_buffer = list(self._ring)  # Copy ring buffer (events leading up to incident)
-        self._capture_remaining = self.post_events  # Now collect N more events after trigger
+        # Take at most FLIGHT_PRE_EVENTS from the 10-minute rolling window
+        ring_list = list(self._ring)
+        self._capture_buffer = ring_list[-FLIGHT_PRE_EVENTS:] if len(ring_list) > FLIGHT_PRE_EVENTS else ring_list
+        self._capture_remaining = FLIGHT_POST_EVENTS
         self._incident_reason = reason
         self._last_incident_time = now
         log.warning(f"Incident triggered: {reason}")
@@ -338,13 +375,16 @@ class FlightRecorder:
                     f.write(orjson.dumps(event) + b"\n")
 
             # Write metadata for incident context
+            total_events = len(self._capture_buffer)
+            pre_count = min(total_events, FLIGHT_PRE_EVENTS)
+            post_count = max(0, total_events - pre_count)
             meta = {
                 "incident_id": incident_id,
                 "reason": self._incident_reason,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "pre_events": len([e for e in self._capture_buffer[: self.pre_events]]),
-                "post_events": len(self._capture_buffer) - self.pre_events,
-                "total_events": len(self._capture_buffer),
+                "pre_events": pre_count,
+                "post_events": post_count,
+                "total_events": total_events,
             }
             meta_path = os.path.join(incident_dir, "meta.json")
             with open(meta_path, "wb") as f:
@@ -361,7 +401,7 @@ class FlightRecorder:
         # Reset to normal operation
         self._capturing = False
         self._capture_buffer = []
-        self._ring.clear()  # Clear ring to avoid re-capturing same events
+        # Keep ring buffer intact for overlapping incidents - don't clear
 
     @property
     def incidents_captured(self) -> int:

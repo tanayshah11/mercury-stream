@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Replay tool for MercuryStream incident files and recorded data.
+Replay tool for MercuryStream incident files.
 
-This tool is used to replay events from a JSONL file to a P2 service.
+Replays captured incident events to the processor for testing and reproduction.
 Usage:
-    python replay.py --file data/btcusd.jsonl --rate 500
-    python replay.py --file data/incidents/123/events.jsonl --rate 100 --shuffle-window 10 --duplicate-rate 0.05
+    python replay.py --file data/incidents/<id>/events.jsonl --rate 500
+    python replay.py --file data/incidents/<id>/events.jsonl --rate 100 --shuffle-window 10 --duplicate-rate 0.05
 """
 
 import asyncio
@@ -37,33 +37,29 @@ def frame(payload: bytes) -> bytes:
 
 
 class RateLimiter:
-    """Token bucket rate limiter."""
+    """Simple interval-based rate limiter for accurate throughput control."""
 
     def __init__(self, rate: float) -> None:
-        self.rate = rate  # tokens per second
-        self.tokens = 0.0  # current token balance
-        self.last_time = time.monotonic()
+        self.rate = rate
+        self.interval = 1.0 / rate if rate > 0 else 0  # Time between events
+        self.next_time = time.monotonic()  # When we can send next
 
     async def acquire(self) -> None:
-        """Block until a token is available based on configured rate"""
+        """Wait until it's time to send the next event"""
         if self.rate <= 0:
             return
 
         now = time.monotonic()
-        elapsed = now - self.last_time
-        # Replenish tokens based on elapsed time
-        self.tokens += elapsed * self.rate
-        self.tokens = min(self.tokens, 10.0)  # cap burst to 10 tokens max
-        self.last_time = now
+        if now < self.next_time:
+            # Not yet time - wait for the remaining interval
+            await asyncio.sleep(self.next_time - now)
 
-        if self.tokens < 1.0:
-            # Need to wait for next token
-            wait_time = (1.0 - self.tokens) / self.rate
-            await asyncio.sleep(wait_time)
-            self.tokens = 0.0
-        else:
-            # Consume one token
-            self.tokens -= 1.0
+        # Schedule next send time (from target, not actual, to prevent drift)
+        self.next_time += self.interval
+
+        # If we fell behind (next_time is in the past), catch up
+        if self.next_time < time.monotonic():
+            self.next_time = time.monotonic() + self.interval
 
 
 def apply_shuffle(events: list[dict], window_size: int) -> list[dict]:
@@ -152,44 +148,8 @@ async def replay(
 ) -> None:
     """Load events from JSONL file, apply chaos testing transforms, and stream to P2 service"""
 
-    if not os.path.exists(file_path):
-        log.error(f"File not found: {file_path}")
-        return
-
-    # Load all events from JSONL file into memory
-    log.info(f"Loading events from {file_path}")
-    events = []
-    with open(file_path, "rb") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = orjson.loads(line)
-                events.append(event)
-            except orjson.JSONDecodeError as e:
-                log.warning(f"Skipping invalid JSON: {e}")
-
-    if not events:
-        log.error("No events to replay")
-        return
-
-    log.info(f"Loaded {len(events)} events")
-
-    # Apply chaos engineering transforms to test system resilience
-    if shuffle_window > 0:
-        log.info(f"Applying shuffle with window size {shuffle_window}")
-        events = apply_shuffle(events, shuffle_window)
-
-    if duplicate_rate > 0:
-        original_count = len(events)
-        events = inject_duplicates(events, duplicate_rate)
-        log.info(f"Injected duplicates: {original_count} -> {len(events)} events")
-
-    if drift_rate > 0:
-        events = inject_drift(events, drift_rate)
-        drift_count = int(len(events) * drift_rate)
-        log.info(f"Injected schema drift: ~{drift_count} events")
+    # Check if transformations are needed
+    needs_transforms = shuffle_window > 0 or duplicate_rate > 0 or drift_rate > 0
 
     # Establish TCP connection to P2 service
     log.info(f"Connecting to P2 at {host}:{port}")
@@ -203,28 +163,127 @@ async def replay(
     sent = 0
     start_time = time.monotonic()
 
-    # Stream events to P2 with optional rate limiting
     try:
-        for event in events:
-            # Optionally replace timestamps with current time
-            if update_timestamps:
-                event["ingest_ts_ms"] = now_ms()
+        if needs_transforms:
+            # Need to load into memory for transformations
+            log.info(f"Loading events from {file_path} (transformations enabled)")
+            events = []
+            try:
+                with open(file_path, "rb") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = orjson.loads(line)
+                            events.append(event)
+                        except orjson.JSONDecodeError as e:
+                            log.warning(f"Skipping invalid JSON: {e}")
+            except FileNotFoundError:
+                log.error(f"File not found: {file_path}")
+                return
+            except IOError as e:
+                log.error(f"Failed to read file: {e}")
+                return
 
-            # Serialize and frame with length prefix for P2 protocol
-            payload = orjson.dumps(event)
-            writer.write(frame(payload))
-            await writer.drain()
+            if not events:
+                log.error("No events to replay")
+                return
 
-            sent += 1
-            # Apply rate limiting if configured
-            if rate > 0:
-                await rate_limiter.acquire()
+            log.info(f"Loaded {len(events)} events")
 
-            # Progress logging every 1k events
-            if sent % 1000 == 0:
-                elapsed = time.monotonic() - start_time
-                actual_rate = sent / elapsed if elapsed > 0 else 0
-                log.info(f"Sent {sent}/{len(events)} events ({actual_rate:.1f}/s)")
+            # Apply chaos engineering transforms to test system resilience
+            if shuffle_window > 0:
+                log.info(f"Applying shuffle with window size {shuffle_window}")
+                events = apply_shuffle(events, shuffle_window)
+
+            if duplicate_rate > 0:
+                original_count = len(events)
+                events = inject_duplicates(events, duplicate_rate)
+                log.info(f"Injected duplicates: {original_count} -> {len(events)} events")
+
+            if drift_rate > 0:
+                events = inject_drift(events, drift_rate)
+                drift_count = int(len(events) * drift_rate)
+                log.info(f"Injected schema drift: ~{drift_count} events")
+
+            total_events = len(events)
+
+            # Stream events to P2 with optional rate limiting
+            for event in events:
+                # Rate limit BEFORE sending to control throughput accurately
+                if rate > 0:
+                    await rate_limiter.acquire()
+
+                # Set timestamp and feeder_id right before sending
+                if update_timestamps:
+                    event["ingest_ts_ms"] = now_ms()
+                    # Remove old recv_ts_ms so processor sets it fresh
+                    event.pop("recv_ts_ms", None)
+                # Always set feeder_id for proper forensics tracking
+                event["feeder_id"] = "replay"
+
+                # Serialize and frame with length prefix for P2 protocol
+                payload = orjson.dumps(event)
+                writer.write(frame(payload))
+                await writer.drain()
+
+                sent += 1
+
+                # Progress logging every 1k events
+                if sent % 1000 == 0:
+                    elapsed = time.monotonic() - start_time
+                    actual_rate = sent / elapsed if elapsed > 0 else 0
+                    log.info(f"Sent {sent}/{total_events} events ({actual_rate:.1f}/s)")
+
+        else:
+            # Stream directly from file without loading into memory
+            log.info(f"Streaming events from {file_path} (memory-efficient mode)")
+
+            try:
+                with open(file_path, "rb") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        try:
+                            event = orjson.loads(line)
+                        except orjson.JSONDecodeError as e:
+                            log.warning(f"Skipping invalid JSON: {e}")
+                            continue
+
+                        # Rate limit BEFORE sending to control throughput accurately
+                        if rate > 0:
+                            await rate_limiter.acquire()
+
+                        # Set timestamp and feeder_id right before sending
+                        if update_timestamps:
+                            event["ingest_ts_ms"] = now_ms()
+                            # Remove old recv_ts_ms so processor sets it fresh
+                            event.pop("recv_ts_ms", None)
+                        # Always set feeder_id for proper forensics tracking
+                        event["feeder_id"] = "replay"
+
+                        # Serialize and frame with length prefix for P2 protocol
+                        payload = orjson.dumps(event)
+                        writer.write(frame(payload))
+                        await writer.drain()
+
+                        sent += 1
+
+                        # Progress logging every 1k events
+                        if sent % 1000 == 0:
+                            elapsed = time.monotonic() - start_time
+                            actual_rate = sent / elapsed if elapsed > 0 else 0
+                            log.info(f"Sent {sent} events ({actual_rate:.1f}/s)")
+
+            except FileNotFoundError:
+                log.error(f"File not found: {file_path}")
+                return
+            except IOError as e:
+                log.error(f"Failed to read file: {e}")
+                return
 
     except (BrokenPipeError, ConnectionResetError) as e:
         log.error(f"Connection lost: {e}")

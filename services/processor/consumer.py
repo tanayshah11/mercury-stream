@@ -2,7 +2,6 @@ import asyncio
 import math
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
 from typing import Protocol
 
 from shared.logger import log
@@ -21,15 +20,6 @@ def percentile(sorted_vals: list[int], p: float) -> float:
     return float(sorted_vals[k])
 
 
-@dataclass
-class SymbolStats:
-    """Per-symbol statistics tracker."""
-    prices: deque = field(default_factory=lambda: deque(maxlen=200))
-    sizes: deque = field(default_factory=lambda: deque(maxlen=200))
-    returns: deque = field(default_factory=lambda: deque(maxlen=100))
-    last_price: float = 0.0
-    event_count: int = 0
-    volume_total: float = 0.0
 
 
 class BusLike(Protocol):
@@ -65,8 +55,9 @@ async def consumer_vwap(bus: BusLike, window_n: int = 200, print_every_s: float 
 
     # Rolling window of (price, size) tuples per symbol
     windows: dict[str, deque] = defaultdict(lambda: deque(maxlen=window_n))
-    ages_ms: deque[int] = deque(maxlen=3000)  # Latency: exchange -> now
-    pipes_ms: deque[int] = deque(maxlen=3000)  # Latency: recv -> now
+    # Latency tracking (both in milliseconds)
+    e2e_latencies: deque[int] = deque(maxlen=3000)  # End-to-end: ingest -> consumer
+    proc_latencies: deque[int] = deque(maxlen=3000)  # Processor only: recv -> consumer
     last_print = time.time()
 
     while True:
@@ -79,21 +70,21 @@ async def consumer_vwap(bus: BusLike, window_n: int = 200, print_every_s: float 
                 symbol = e.get("product_id", "UNKNOWN")
                 price = float(e.get("price", 0.0))
                 size = float(e.get("last_size", 0.0))
-                ingest_ts = int(e.get("ingest_ts_ms", 0))  # When exchange sent the msg
-                recv_ts = int(e.get("recv_ts_ms", 0)) if e.get("recv_ts_ms") else 0  # When we received it
+                ingest_ts = int(e.get("ingest_ts_ms", 0))  # When ingester/replay sent it
+                recv_ts = int(e.get("recv_ts_ms", 0)) if e.get("recv_ts_ms") else 0  # When processor received it
             except Exception:
                 continue
 
-            if price <= 0 or size < 0 or ingest_ts <= 0:
+            if price <= 0 or size <= 0 or ingest_ts <= 0:
                 continue
 
             windows[symbol].append((price, size))
 
             # Track latency metrics
             now = now_ms()
-            ages_ms.append(max(0, now - ingest_ts))  # Total age from exchange
+            e2e_latencies.append(max(0, now - ingest_ts))  # Full pipeline latency
             if recv_ts > 0:
-                pipes_ms.append(max(0, now - recv_ts))  # Processing lag in pipeline
+                proc_latencies.append(max(0, now - recv_ts))  # Processor-only latency
 
             if (time.time() - last_print) >= print_every_s:
                 # VWAP = sum(price * size) / sum(size) for each symbol
@@ -105,14 +96,14 @@ async def consumer_vwap(bus: BusLike, window_n: int = 200, print_every_s: float 
                         vwap = (num / den) if den > 0 else 0.0
                         vwaps.append(f"{sym}={vwap:.2f}")
 
-                ages_sorted = sorted(ages_ms)
-                pipes_sorted = sorted(pipes_ms)
+                e2e_sorted = sorted(e2e_latencies)
+                proc_sorted = sorted(proc_latencies)
 
                 log.log(
                     "VWAP",
                     f"{' | '.join(vwaps)} | "
-                    f"age p99={percentile(ages_sorted, 99):.0f}ms | "
-                    f"pipe p99={percentile(pipes_sorted, 99):.0f}ms | drops={bus.drops}"
+                    f"e2e p99={percentile(e2e_sorted, 99):.0f}ms | "
+                    f"proc p99={percentile(proc_sorted, 99):.0f}ms | drops={bus.drops}"
                 )
                 last_print = time.time()
 
@@ -182,8 +173,11 @@ async def consumer_volatility(bus: BusLike, window_n: int = 100, print_every_s: 
 
             # Log return = ln(P_t / P_{t-1}) - better for compounding
             if symbol in last_prices and last_prices[symbol] > 0:
-                log_return = math.log(price / last_prices[symbol])
-                returns[symbol].append(log_return)
+                price_ratio = price / last_prices[symbol]
+                # Bound price ratio to prevent math.log overflow (e^±20 is ~500M x change)
+                if 1e-9 < price_ratio < 1e9:
+                    log_return = math.log(price_ratio)
+                    returns[symbol].append(log_return)
 
             last_prices[symbol] = price
 
@@ -192,11 +186,13 @@ async def consumer_volatility(bus: BusLike, window_n: int = 100, print_every_s: 
                 for sym in sorted(returns.keys()):
                     r = returns[sym]
                     if len(r) >= 10:
-                        # Sample variance of log returns
+                        # Sample variance of log returns (Bessel's correction: divide by n-1)
                         mean_r = sum(r) / len(r)
-                        var = sum((x - mean_r) ** 2 for x in r) / len(r)
+                        var = sum((x - mean_r) ** 2 for x in r) / (len(r) - 1)
                         std = math.sqrt(var) if var > 0 else 0
-                        # Annualize: assumes 1 tick/sec → 86400 ticks/day → 31.5M ticks/yr
+                        # Annualize volatility to % per year
+                        # NOTE: Assumes ~1 tick/sec arrival rate (86400 ticks/day, 31.5M ticks/yr)
+                        # For different tick rates, adjust the scaling factor accordingly
                         annual_vol = std * math.sqrt(86400 * 365) * 100
                         vols.append(f"{sym}={annual_vol:.1f}%")
 

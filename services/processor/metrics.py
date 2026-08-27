@@ -8,10 +8,13 @@ import asyncio
 import os
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread
+from threading import Thread, Lock
 from typing import Callable
 
-# Metrics state (thread-safe via atomic operations)
+# Thread-safe metrics lock - protects all metric updates
+_metrics_lock = Lock()
+
+# Metrics state - all updates must be protected by _metrics_lock
 # Stores all metric values - counters accumulate, gauges are snapshots
 _metrics = {
     "events_total": 0,  # counter: total events processed
@@ -43,81 +46,91 @@ METRICS_PORT = int(os.getenv("METRICS_PORT", "9090"))
 
 
 def inc(name: str, value: int = 1) -> None:
-    """Increment a counter metric."""
-    _metrics[name] = _metrics.get(name, 0) + value
+    """Increment a counter metric (thread-safe)."""
+    with _metrics_lock:
+        _metrics[name] = _metrics.get(name, 0) + value
 
 
 def set_gauge(name: str, value: float) -> None:
-    """Set a gauge metric."""
-    _metrics[name] = value
+    """Set a gauge metric (thread-safe)."""
+    with _metrics_lock:
+        _metrics[name] = value
 
 
 def observe_latency(latency_ms: int) -> None:
-    """Record a latency observation for histogram."""
-    # Track sum & count for average calculation
-    _metrics["latency_sum_ms"] += latency_ms
-    _metrics["latency_count"] += 1
+    """Record a latency observation for histogram (thread-safe)."""
+    with _metrics_lock:
+        # Track sum & count for average calculation
+        _metrics["latency_sum_ms"] += latency_ms
+        _metrics["latency_count"] += 1
 
-    # Update min/max bounds (0 means uninitialized)
-    if _metrics["latency_min_ms"] == 0 or latency_ms < _metrics["latency_min_ms"]:
-        _metrics["latency_min_ms"] = latency_ms
-    if latency_ms > _metrics["latency_max_ms"]:
-        _metrics["latency_max_ms"] = latency_ms
+        # Update min/max bounds (0 means uninitialized)
+        if _metrics["latency_min_ms"] == 0 or latency_ms < _metrics["latency_min_ms"]:
+            _metrics["latency_min_ms"] = latency_ms
+        if latency_ms > _metrics["latency_max_ms"]:
+            _metrics["latency_max_ms"] = latency_ms
 
-    # Increment first matching bucket (creates distribution)
-    # Only increments one bucket per observation to avoid double-counting
-    for bucket in _latency_buckets:
-        if latency_ms <= bucket:
-            _latency_histogram[bucket] += 1
-            break
+        # Increment first matching bucket (creates distribution)
+        # Only increments one bucket per observation to avoid double-counting
+        for bucket in _latency_buckets:
+            if latency_ms <= bucket:
+                _latency_histogram[bucket] += 1
+                break
 
 
 def update_rate() -> None:
-    """Update events per second rate."""
+    """Update events per second rate (thread-safe)."""
     global _last_events_total, _last_rate_time
 
     now = time.monotonic()
-    elapsed = now - _last_rate_time
 
-    # Only recalculate rate every 1+ seconds to avoid jitter
-    if elapsed >= 1.0:
-        current_total = _metrics["events_total"]
-        rate = (current_total - _last_events_total) / elapsed  # delta / time = rate
-        _metrics["events_per_second"] = rate
-        _last_events_total = current_total
-        _last_rate_time = now
+    with _metrics_lock:
+        elapsed = now - _last_rate_time
+
+        # Only recalculate rate every 1+ seconds to avoid jitter
+        if elapsed >= 1.0:
+            current_total = _metrics["events_total"]
+            rate = (current_total - _last_events_total) / elapsed  # delta / time = rate
+            _metrics["events_per_second"] = rate
+            _last_events_total = current_total
+            _last_rate_time = now
 
 
 def get_prometheus_metrics() -> str:
-    """Generate Prometheus-format metrics output."""
+    """Generate Prometheus-format metrics output (thread-safe)."""
     update_rate()  # refresh rate calculation before export
+
+    # Take snapshot of metrics under lock to ensure consistency
+    with _metrics_lock:
+        metrics_snapshot = _metrics.copy()
+        histogram_snapshot = _latency_histogram.copy()
 
     # Prometheus exposition format: HELP, TYPE, then metric lines
     lines = [
         "# HELP mercurystream_events_total Total events processed",
         "# TYPE mercurystream_events_total counter",
-        f"mercurystream_events_total {_metrics['events_total']}",
+        f"mercurystream_events_total {metrics_snapshot['events_total']}",
         "",
         "# HELP mercurystream_events_per_second Current events per second",
         "# TYPE mercurystream_events_per_second gauge",
-        f"mercurystream_events_per_second {_metrics['events_per_second']:.2f}",
+        f"mercurystream_events_per_second {metrics_snapshot['events_per_second']:.2f}",
         "",
         "# HELP mercurystream_drops_total Total dropped events",
         "# TYPE mercurystream_drops_total counter",
-        f"mercurystream_drops_total {_metrics['drops_total']}",
+        f"mercurystream_drops_total {metrics_snapshot['drops_total']}",
         "",
         "# HELP mercurystream_anomalies_total Total anomalies detected by type",
         "# TYPE mercurystream_anomalies_total counter",
         # Labels {type="..."} allow grouping different anomaly types under same metric
-        f'mercurystream_anomalies_total{{type="duplicate"}} {_metrics["anomalies_duplicate"]}',
-        f'mercurystream_anomalies_total{{type="out_of_order"}} {_metrics["anomalies_ooo"]}',
-        f'mercurystream_anomalies_total{{type="sequence_gap"}} {_metrics["anomalies_gap"]}',
-        f'mercurystream_anomalies_total{{type="schema_drift"}} {_metrics["anomalies_drift"]}',
-        f'mercurystream_anomalies_total{{type="latency_spike"}} {_metrics["anomalies_latency_spike"]}',
+        f'mercurystream_anomalies_total{{type="duplicate"}} {metrics_snapshot["anomalies_duplicate"]}',
+        f'mercurystream_anomalies_total{{type="out_of_order"}} {metrics_snapshot["anomalies_ooo"]}',
+        f'mercurystream_anomalies_total{{type="sequence_gap"}} {metrics_snapshot["anomalies_gap"]}',
+        f'mercurystream_anomalies_total{{type="schema_drift"}} {metrics_snapshot["anomalies_drift"]}',
+        f'mercurystream_anomalies_total{{type="latency_spike"}} {metrics_snapshot["anomalies_latency_spike"]}',
         "",
         "# HELP mercurystream_incidents_total Total incidents captured",
         "# TYPE mercurystream_incidents_total counter",
-        f"mercurystream_incidents_total {_metrics['incidents_total']}",
+        f"mercurystream_incidents_total {metrics_snapshot['incidents_total']}",
         "",
         "# HELP mercurystream_latency_ms Event latency histogram",
         "# TYPE mercurystream_latency_ms histogram",
@@ -127,7 +140,7 @@ def get_prometheus_metrics() -> str:
     # Prometheus uses this to calculate quantiles (p50, p95, p99)
     cumulative = 0
     for bucket in _latency_buckets:
-        cumulative += _latency_histogram[bucket]  # sum all observations up to this bucket
+        cumulative += histogram_snapshot[bucket]  # sum all observations up to this bucket
         if bucket == float("inf"):
             lines.append(f'mercurystream_latency_ms_bucket{{le="+Inf"}} {cumulative}')
         else:
@@ -135,12 +148,12 @@ def get_prometheus_metrics() -> str:
 
     # Histogram requires _sum and _count for average calculation
     lines.extend([
-        f"mercurystream_latency_ms_sum {_metrics['latency_sum_ms']}",
-        f"mercurystream_latency_ms_count {_metrics['latency_count']}",
+        f"mercurystream_latency_ms_sum {metrics_snapshot['latency_sum_ms']}",
+        f"mercurystream_latency_ms_count {metrics_snapshot['latency_count']}",
         "",
         "# HELP mercurystream_queue_depth_max Maximum queue depth across consumers",
         "# TYPE mercurystream_queue_depth_max gauge",
-        f"mercurystream_queue_depth_max {_metrics['queue_depth_max']}",
+        f"mercurystream_queue_depth_max {metrics_snapshot['queue_depth_max']}",
         "",
     ])
 

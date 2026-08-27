@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import struct
 import time
@@ -13,8 +12,9 @@ from shared import log, Ticker
 # Ingester: connects to Coinbase WebSocket and forwards to Processor
 PROCESSOR_HOST = os.getenv("PROCESSOR_HOST", "processor")
 PROCESSOR_PORT = int(os.getenv("PROCESSOR_PORT", "9001"))
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC-USD,ETH-USD,SOL-USD").split(",")]
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC-USD,ETH-USD,SOL-USD").split(",") if s.strip()]
 BACKOFF_MAX = float(os.getenv("BACKOFF_MAX", "10.0"))
+WS_RECV_TIMEOUT = float(os.getenv("WS_RECV_TIMEOUT", "30.0"))  # Seconds before recv() times out
 
 
 def now_ms() -> int:
@@ -27,13 +27,13 @@ def frame(payload: bytes) -> bytes:
 
 
 def build_subscribe_message(symbols: list[str]) -> str:
-    return json.dumps(
+    return orjson.dumps(
         {
             "type": "subscribe",
             "product_ids": symbols,
             "channels": [{"name": "ticker", "product_ids": symbols}],
         }
-    )
+    ).decode("utf-8")
 
 
 async def run() -> None:
@@ -44,7 +44,16 @@ async def run() -> None:
     while True:
         try:
             # Establish TCP connection to P2 for forwarding
-            if writer is None:
+            # Check both if writer is None AND if it's healthy (not closed)
+            if writer is None or writer.is_closing():
+                # Clean up old writer if it exists
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+
                 _, writer = await asyncio.open_connection(PROCESSOR_HOST, PROCESSOR_PORT)
                 log.info(f"Connected to processor at {PROCESSOR_HOST}:{PROCESSOR_PORT}")
 
@@ -57,10 +66,16 @@ async def run() -> None:
                 backoff_s = 1.0
 
                 while True:
-                    response = await ws.recv()
+                    # Add timeout to prevent hanging if Coinbase stops sending
                     try:
-                        json_response = json.loads(response)
-                    except json.JSONDecodeError as ex:
+                        response = await asyncio.wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT)
+                    except TimeoutError:
+                        log.warning(f"WebSocket recv timeout ({WS_RECV_TIMEOUT}s), reconnecting")
+                        break  # Exit inner loop to reconnect
+
+                    try:
+                        json_response = orjson.loads(response)
+                    except orjson.JSONDecodeError as ex:
                         log.warning(f"WS JSON decode error: {ex}")
                         continue
 
@@ -75,21 +90,25 @@ async def run() -> None:
                         log.warning(f"Validation error: {e}")
                         continue
 
-                    # Add ingestion timestamp and serialize
+                    # Add ingestion timestamp and feeder ID for forensics tracking
                     event = ticker.model_dump()
                     event["ingest_ts_ms"] = now_ms()
+                    event["feeder_id"] = "coinbase"  # Identifies data source
                     payload = orjson.dumps(event)
 
                     # Forward framed message to P2 via TCP
                     try:
                         writer.write(frame(payload))
-                        await writer.drain()
+                        # Use wait_for with timeout to prevent unbounded memory buildup
+                        await asyncio.wait_for(writer.drain(), timeout=5.0)
                         backoff_s = 1.0
+                    except TimeoutError:
+                        raise OSError("IPC drain timeout - TCP write buffer full") from None
                     except (BrokenPipeError, ConnectionResetError, OSError) as ex:
                         raise OSError(f"IPC write failed: {ex}") from ex
 
-        except (OSError, websockets.WebSocketException) as e:
-            # Connection lost - cleanup and retry with exponential backoff
+        except (OSError, websockets.WebSocketException, asyncio.TimeoutError) as e:
+            # Connection lost - cleanup writer and retry with exponential backoff
             if writer is not None:
                 try:
                     writer.close()

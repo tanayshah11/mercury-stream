@@ -13,14 +13,11 @@ from consumer import (
     consumer_volume,
 )
 from forensics import consumer_forensics
-from recorder import Recorder
 from metrics import start_metrics_server, record_drop, set_queue_depth, METRICS_PORT
 
 # Processor: receives from Ingester, fans out to consumers
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "9001"))
-RECORD = os.getenv("RECORD", "false").lower() == "true"
-RECORD_FILE = os.getenv("RECORD_FILE", "data/btcusd.jsonl")
 FORENSICS = os.getenv("FORENSICS", "true").lower() == "true"
 MAX_FRAME_LEN = 1_000_000
 
@@ -78,7 +75,6 @@ async def handle_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     bus: Bus,
-    recorder: Recorder | None = None,
 ) -> None:
     # Handle incoming TCP connection from P1
     peer = writer.get_extra_info("peername")
@@ -106,10 +102,6 @@ async def handle_client(
             if "recv_ts_ms" not in event:
                 event["recv_ts_ms"] = now_ms()
 
-            # Optional: persist to disk
-            if recorder is not None:
-                recorder.record(event)
-
             # Fan out to all consumer queues
             bus.publish(event)
 
@@ -132,21 +124,14 @@ async def metrics_updater(bus: Bus, interval_s: float = 1.0) -> None:
 
 async def run() -> None:
     bus = Bus()
-    recorder = None
 
     # Start Prometheus metrics endpoint
     start_metrics_server(METRICS_PORT)
     log.info(f"Metrics server started on port {METRICS_PORT}")
 
-    # Optional: enable event recording to disk
-    if RECORD:
-        recorder = Recorder(RECORD_FILE)
-        await recorder.start()
-        log.info(f"Recording enabled -> {RECORD_FILE}")
-
     # TCP server accepting connections from P1
     server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, bus, recorder), HOST, PORT
+        lambda r, w: handle_client(r, w, bus), HOST, PORT
     )
     log.info(f"P2 listening on {HOST}:{PORT}")
 
